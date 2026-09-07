@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="./banner.svg" alt="jwt-attack-suite" width="800">
+</div>
+
 # JWT Attack Suite
 
 A Python-based utility designed to security-audit JSON Web Tokens (JWT) for common configuration flaws, signature bypasses, and validation weaknesses.
